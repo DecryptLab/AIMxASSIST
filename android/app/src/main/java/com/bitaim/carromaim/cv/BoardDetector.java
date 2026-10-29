@@ -13,14 +13,19 @@ import java.util.Iterator;
 import java.util.List;
 
 /**
- * BoardDetector v10 — Low-End Optimised Build
+ * BoardDetector v11 — noise suppression pass
  *
- * Low-end optimizations added:
- *  – PROC_W is chosen at runtime: 240 px on devices with < 1.5 GB RAM,
- *    360 px otherwise. Smaller proc resolution cuts memory ~2.25× and
- *    speeds up the scan ~55%.
- *  – SCAN_STEP raised from 3 → 4 on low-end, reducing pixel visits ~44%.
- *  – EMA_A raised slightly on low-end so fewer frames needed to track.
+ * Changes vs v10:
+ *  – minHits raised 2 → 7 and area ratio 0.12 → 0.55. Two pixels no longer
+ *    make a coin; wood grain, printed rings and board lines are rejected.
+ *  – WHITE classifier tightened (lum>190, b>175, spread<50). Pale wood used
+ *    to pass as a white coin.
+ *  – Blobs whose estimated radius is outside the coin band are dropped
+ *    instead of clamped, which kills the large printed red rings.
+ *  – Blobs within 7.5% of the board width of a pocket are discarded — the
+ *    four pockets were being detected as black coins.
+ *  – Cluster merge radius tightened on white/black so touching coins stay
+ *    separate.
  *
  * Detection pipeline (unchanged):
  *  1. detectByOrangeDensity()   — primary
@@ -112,10 +117,28 @@ public class BoardDetector {
         float inv = 1f / scale;
         RectF srcBoard = scaleRect(pb, inv);
 
+        // drop blobs sitting on the four pockets
+        float keepOut = srcBoard.width() * 0.075f;
+        float[] pkX = { srcBoard.left + srcBoard.width() * POCKET_INSET,
+                        srcBoard.right - srcBoard.width() * POCKET_INSET,
+                        srcBoard.left + srcBoard.width() * POCKET_INSET,
+                        srcBoard.right - srcBoard.width() * POCKET_INSET };
+        float[] pkY = { srcBoard.top + srcBoard.height() * POCKET_INSET,
+                        srcBoard.top + srcBoard.height() * POCKET_INSET,
+                        srcBoard.bottom - srcBoard.height() * POCKET_INSET,
+                        srcBoard.bottom - srcBoard.height() * POCKET_INSET };
+
         List<Coin> scaled = new ArrayList<>(coins.size());
-        for (Coin c : coins)
-            scaled.add(new Coin(c.pos.x * inv, c.pos.y * inv,
-                    c.radius * inv, c.color, false));
+        for (Coin c : coins) {
+            float sx = c.pos.x * inv, sy = c.pos.y * inv;
+            boolean onPocket = false;
+            for (int k = 0; k < 4; k++) {
+                float dx = sx - pkX[k], dy = sy - pkY[k];
+                if (dx * dx + dy * dy < keepOut * keepOut) { onPocket = true; break; }
+            }
+            if (onPocket) continue;
+            scaled.add(new Coin(sx, sy, c.radius * inv, c.color, false));
+        }
 
         float strikerThreshY = (pb.top + pb.height() * 0.62f) * inv;
         float boardCX        = srcBoard.centerX();
@@ -300,8 +323,8 @@ public class BoardDetector {
             }
         }
         List<Coin> out = new ArrayList<>();
-        cluster(whites, Coin.COLOR_WHITE, maxR*1.6f, minR, maxR,       out);
-        cluster(blacks, Coin.COLOR_BLACK, maxR*1.6f, minR, maxR,       out);
+        cluster(whites, Coin.COLOR_WHITE, maxR*1.3f, minR, maxR,       out);
+        cluster(blacks, Coin.COLOR_BLACK, maxR*1.3f, minR, maxR,       out);
         cluster(reds,   Coin.COLOR_RED,   maxR*1.2f, minR*0.4f, maxR*0.75f, out);
         cluster(blues,  PX_BLUE,          maxR*1.8f, minR, maxR*1.5f, out);
         nms(out);
@@ -311,8 +334,8 @@ public class BoardDetector {
     private int classifyPx(int p) {
         int r=(p>>16)&0xFF, g=(p>>8)&0xFF, b=p&0xFF;
         int lum=(r+g+b)/3;
-        if (lum>150&&r>130&&g>130&&b>110&&(Math.max(r,Math.max(g,b))-Math.min(r,Math.min(g,b)))<70) return Coin.COLOR_WHITE;
-        if (lum<70&&r<85&&g<85&&b<85) return Coin.COLOR_BLACK;
+        if (lum>190&&r>195&&g>190&&b>175&&(Math.max(r,Math.max(g,b))-Math.min(r,Math.min(g,b)))<50) return Coin.COLOR_WHITE;
+        if (lum<60&&r<75&&g<75&&b<75) return Coin.COLOR_BLACK;
         if (r>120&&g<85&&b<95&&r>g*1.7f&&r>b*1.5f) return Coin.COLOR_RED;
         if (b>r+20&&b>g&&b>90&&lum>70&&lum<200&&r<160&&g<170) return PX_BLUE;
         return -1;
@@ -337,10 +360,11 @@ public class BoardDetector {
                 c[2]=n+1;
             } else cl.add(new float[]{pt[0],pt[1],1});
         }
-        int minHits=Math.max(2,(int)(Math.PI*minR*minR/(scanStep*scanStep)*0.12f));
+        int minHits=Math.max(7,(int)(Math.PI*minR*minR/(scanStep*scanStep)*0.55f));
         for (float[] c : cl) {
             if (c[2]<minHits) continue;
             float estR=(float)Math.sqrt(c[2]*scanStep*scanStep/Math.PI);
+            if (estR < minR*0.75f || estR > maxR*1.35f) continue;
             out.add(new Coin(c[0],c[1],Math.max(minR,Math.min(maxR,estR)),color,false));
         }
     }
